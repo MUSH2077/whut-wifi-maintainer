@@ -206,7 +206,6 @@ impl runtime::Network for LiveNetwork {
         network::probe(&self.clients.probe, &config.monitor)
     }
     fn authenticate(&mut self, config: &Config) -> Result<PortalLoginOutcome, RequestError> {
-        portal_auth::reachable(&self.clients.portal)?;
         portal_auth::login(
             &self.clients.portal,
             &self.clients.discovery,

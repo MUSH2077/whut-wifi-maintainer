@@ -33,15 +33,6 @@ pub fn csrf_token(json: &Value) -> Result<&str, RequestError> {
         .ok_or(RequestError::Protocol)
 }
 
-pub fn reachable(client: &Client) -> Result<(), RequestError> {
-    let json: Value = client
-        .get(CSRF_TOKEN_URL)
-        .send()?
-        .error_for_status()?
-        .json()?;
-    csrf_token(&json).map(|_| ())
-}
-
 fn classify_response(result: &Value) -> PortalLoginOutcome {
     if result.get("code").and_then(Value::as_i64) == Some(0)
         || result.get("msg").and_then(Value::as_str) == Some("success")
@@ -183,6 +174,50 @@ mod tests {
             destination.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
+    }
+
+    #[test]
+    fn discovery_session_is_reused_for_csrf_and_login() {
+        use crate::config::{Config, Credentials};
+        use crate::network::HttpClients;
+
+        let discovery = "HTTP/1.1 200 OK\r\nSet-Cookie: portal_session=discovered; Path=/\r\nContent-Length: 9\r\nConnection: close\r\n\r\ndiscovery".to_owned();
+        let (url, server) = serve(vec![
+            discovery,
+            response("200 OK", "{\"csrf_token\":\"token\"}"),
+            response("200 OK", "{\"code\":0}"),
+        ]);
+        let config = Config::new(Credentials {
+            username: "student".into(),
+            password: "secret".into(),
+        });
+        let clients = HttpClients::new(&config).unwrap();
+
+        assert_eq!(
+            login_at(
+                &clients.portal,
+                &clients.discovery,
+                "student",
+                "secret",
+                "52",
+                &Endpoints {
+                    redirect: &url,
+                    csrf: &url,
+                    login: &url,
+                },
+            )
+            .unwrap(),
+            PortalLoginOutcome::Accepted
+        );
+
+        let requests = server.join().unwrap();
+        for request in &requests[1..] {
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("cookie: portal_session=discovered")
+            );
+        }
     }
 
     #[test]

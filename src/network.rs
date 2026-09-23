@@ -1,8 +1,10 @@
 use reqwest::blocking::{Client, ClientBuilder};
+use reqwest::cookie::Jar;
 
 use crate::config::{Config, MonitorSettings};
 use crate::protocol::USER_AGENT;
 use std::io::Read;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(thiserror::Error, Debug)]
@@ -41,13 +43,15 @@ pub struct HttpClients {
 impl HttpClients {
     pub fn new(config: &Config) -> Result<Self, RequestError> {
         let make = || configured_builder(config);
+        let portal_cookies = Arc::new(Jar::default());
         Ok(Self {
             probe: make().redirect(reqwest::redirect::Policy::none()).build()?,
             portal: make()
-                .cookie_store(true)
+                .cookie_provider(Arc::clone(&portal_cookies))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             discovery: make()
+                .cookie_provider(portal_cookies)
                 .redirect(reqwest::redirect::Policy::limited(5))
                 .build()?,
         })
