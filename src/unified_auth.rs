@@ -19,6 +19,7 @@ struct RsaKeyResponse {
     public_key: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum CredentialVerification {
     Valid,
     Invalid,
@@ -28,10 +29,10 @@ pub enum CredentialVerification {
 fn hidden_input_value(html: &str, id: &str) -> Result<Option<String>, Box<dyn Error>> {
     let input_re = Regex::new(r#"(?is)<input\b[^>]*>"#)?;
     let id_re = Regex::new(&format!(
-        r#"(?i)\bid\s*=\s*[\"']{}[\"']"#,
+        r#"(?i)(?:^|\s)id\s*=\s*[\"']{}[\"']"#,
         regex::escape(id)
     ))?;
-    let value_re = Regex::new(r#"(?i)\bvalue\s*=\s*[\"']([^\"']*)[\"']"#)?;
+    let value_re = Regex::new(r#"(?i)(?:^|\s)value\s*=\s*[\"']([^\"']*)[\"']"#)?;
 
     Ok(input_re.find_iter(html).find_map(|input| {
         let input = input.as_str();
@@ -46,7 +47,7 @@ fn hidden_input_value(html: &str, id: &str) -> Result<Option<String>, Box<dyn Er
 
 fn unified_error_message(html: &str) -> Result<Option<String>, Box<dyn Error>> {
     let error_re =
-        Regex::new(r#"(?is)<[^>]*\bid\s*=\s*[\"']errormsghide[\"'][^>]*>(.*?)</[^>]+>"#)?;
+        Regex::new(r#"(?is)<[^>]*\sid\s*=\s*[\"']errormsghide[\"'][^>]*>(.*?)</[^>]+>"#)?;
     let tag_re = Regex::new(r#"(?is)<[^>]+>"#)?;
 
     Ok(error_re
@@ -59,6 +60,22 @@ fn unified_error_message(html: &str) -> Result<Option<String>, Box<dyn Error>> {
 fn encrypt(public_key: &RsaPublicKey, value: &str) -> Result<String, Box<dyn Error>> {
     let encrypted = public_key.encrypt(&mut OsRng, Pkcs1v15Encrypt, value.as_bytes())?;
     Ok(BASE64_STANDARD.encode(encrypted))
+}
+
+fn is_service_redirect(response_url: &reqwest::Url, location: &str) -> bool {
+    let service = reqwest::Url::parse(UNIFIED_SERVICE_URL).expect("constant URL");
+    response_url.join(location).is_ok_and(|destination| {
+        destination.origin() == service.origin()
+            && destination.path().starts_with(service.path())
+    })
+}
+
+fn classify_login_page(html: &str) -> Result<CredentialVerification, RequestError> {
+    match unified_error_message(html).map_err(|_| RequestError::Protocol)? {
+        Some(message) if credentials_rejected(&message) => Ok(CredentialVerification::Invalid),
+        Some(_) => Err(RequestError::Protocol),
+        None => Ok(CredentialVerification::Inconclusive),
+    }
 }
 
 pub fn verify_credentials(
@@ -109,10 +126,7 @@ pub fn verify_credentials(
             .and_then(|value| value.to_str().ok())
             .ok_or(RequestError::Protocol)?;
 
-        if reqwest::Url::parse(location).is_ok_and(|url| {
-            let expected = reqwest::Url::parse(UNIFIED_SERVICE_URL).expect("constant URL");
-            url.origin() == expected.origin() && url.path() == expected.path()
-        }) {
+        if is_service_redirect(login_response.url(), location) {
             return Ok(CredentialVerification::Valid);
         }
 
@@ -123,20 +137,12 @@ pub fn verify_credentials(
         return Err(RequestError::Status(login_response.status().as_u16()));
     }
 
-    let response_html = login_response.text()?;
-    if unified_error_message(&response_html)
-        .map_err(|_| RequestError::Protocol)?
-        .is_some_and(|message| credentials_rejected(&message))
-    {
-        return Ok(CredentialVerification::Invalid);
-    }
-
-    Ok(CredentialVerification::Inconclusive)
+    classify_login_page(&login_response.text()?)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{hidden_input_value, unified_error_message};
+    use super::*;
 
     #[test]
     fn extracts_lt_from_login_page() {
@@ -156,5 +162,53 @@ mod tests {
             unified_error_message(html).unwrap(),
             Some("密码错误".to_string())
         );
+    }
+
+    #[test]
+    fn data_attributes_are_not_login_fields() {
+        assert_eq!(
+            hidden_input_value(r#"<input data-id="lt" value="wrong">"#, "lt").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn other_unified_errors_are_not_credential_rejections() {
+        for message in [
+            "验证码错误",
+            "会话已过期",
+            "系统维护中",
+            "账号已锁定",
+            "密码错误次数过多，账号已锁定",
+        ] {
+            let html = format!(r#"<span id="errormsghide">{message}</span>"#);
+            assert!(classify_login_page(&html).is_err());
+        }
+        assert_eq!(
+            classify_login_page(r#"<span id="errormsghide">用户名或密码错误</span>"#).unwrap(),
+            CredentialVerification::Invalid
+        );
+        assert_eq!(
+            classify_login_page("<html>unknown response</html>").unwrap(),
+            CredentialVerification::Inconclusive
+        );
+    }
+
+    #[test]
+    fn service_redirects_use_resolved_urls() {
+        let response_url = reqwest::Url::parse(UNIFIED_LOGIN_URL).unwrap();
+        assert!(is_service_redirect(
+            &response_url,
+            "https://zhlgd.whut.edu.cn/tp_up/?ticket=fixture"
+        ));
+        assert!(is_service_redirect(&response_url, "/tp_up/?ticket=fixture"));
+        for location in [
+            "https://zhlgd.whut.edu.cn/tp_up/../tpass/login",
+            "https://zhlgd.whut.edu.cn/tp_up/%2e%2e/tpass/login",
+            "https://zhlgd.whut.edu.cn.evil.invalid/tp_up/",
+            "http://zhlgd.whut.edu.cn/tp_up/",
+        ] {
+            assert!(!is_service_redirect(&response_url, location));
+        }
     }
 }

@@ -71,12 +71,11 @@ pub fn csrf_token(json: &Value) -> Result<&str, RequestError> {
         .ok_or(RequestError::Protocol)
 }
 
-fn classify_response(result: &Value) -> PortalLoginOutcome {
-    if result.get("code").and_then(Value::as_i64) == Some(0)
-        || result.get("msg").and_then(Value::as_str) == Some("success")
-    {
-        return PortalLoginOutcome::Accepted;
+fn classify_response(result: &Value) -> Result<PortalLoginOutcome, RequestError> {
+    if result.get("code").is_some_and(|code| !code.is_i64()) {
+        return Err(RequestError::Protocol);
     }
+    let code = result.get("code").and_then(Value::as_i64);
     let message = result
         .get("authMsg")
         .and_then(Value::as_str)
@@ -84,12 +83,27 @@ fn classify_response(result: &Value) -> PortalLoginOutcome {
         .or_else(|| result.get("msg").and_then(Value::as_str))
         .unwrap_or("");
     if message.contains("余额不足") {
-        PortalLoginOutcome::BalanceInsufficient
-    } else if credentials_rejected(message) {
-        PortalLoginOutcome::CredentialsRejected
-    } else {
-        PortalLoginOutcome::Inconclusive
+        return Ok(PortalLoginOutcome::BalanceInsufficient);
     }
+
+    let success_message = result.get("msg").and_then(Value::as_str) == Some("success");
+    let success = code == Some(0) || (code.is_none() && success_message);
+    if success {
+        if credentials_rejected(message) {
+            return Err(RequestError::Protocol);
+        }
+        return Ok(PortalLoginOutcome::Accepted);
+    }
+    if success_message {
+        return Err(RequestError::Protocol);
+    }
+    if credentials_rejected(message) {
+        return Ok(PortalLoginOutcome::CredentialsRejected);
+    }
+    if code.is_some() || !message.is_empty() {
+        return Ok(PortalLoginOutcome::Inconclusive);
+    }
+    Err(RequestError::Protocol)
 }
 
 pub fn login(
@@ -133,6 +147,9 @@ fn login_at(
         .send()
         .ok()
         .and_then(|response| {
+            if !response.status().is_success() {
+                return None;
+            }
             extract_portal_context(response.url().as_str(), endpoints.login, fallback_nas_id)
                 .map(|context| (response.url().clone(), context))
         });
@@ -175,7 +192,7 @@ fn login_at(
         return Err(RequestError::Protocol);
     }
     let result: Value = response.error_for_status()?.json()?;
-    Ok(classify_response(&result))
+    classify_response(&result)
 }
 
 #[cfg(test)]
@@ -299,6 +316,59 @@ mod tests {
     }
 
     #[test]
+    fn unsuccessful_portal_landing_uses_fallback_context_without_referer() {
+        use crate::config::{Config, Credentials};
+        use crate::network::HttpClients;
+
+        let (portal_url, portal) = serve(vec![
+            response("500 Internal Server Error", "failed landing"),
+            response("200 OK", "{\"csrf_token\":\"token\"}"),
+            response("200 OK", "{\"code\":0}"),
+        ]);
+        let discovery_url = format!(
+            "{portal_url}?switchip=10.1.0.1&nasId=77&wlanuserip=10.1.2.3&mac=aa:bb:cc:dd:ee:ff"
+        );
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {discovery_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let (entry_url, entry) = serve(vec![redirect]);
+        let config = Config::new(Credentials {
+            username: "student".into(),
+            password: "secret".into(),
+        });
+        let clients = HttpClients::new(&config).unwrap();
+
+        assert_eq!(
+            login_at(
+                &clients.portal,
+                &clients.discovery,
+                "student",
+                "secret",
+                "52",
+                &Endpoints {
+                    redirect: &entry_url,
+                    csrf: &portal_url,
+                    login: &portal_url,
+                },
+            )
+            .unwrap(),
+            PortalLoginOutcome::Accepted
+        );
+
+        assert_eq!(entry.join().unwrap().len(), 1);
+        let requests = portal.join().unwrap();
+        let login = &requests[2];
+        assert!(!login.to_ascii_lowercase().contains("\r\nreferer:"));
+        let form = login.split_once("\r\n\r\n").unwrap().1;
+        assert!(form.contains("nasId=52"));
+        assert!(form.contains("switchip=&"));
+        assert!(form.contains("userIpv4=&"));
+        assert!(form.contains("userMac=&"));
+        assert!(!form.contains("10.1.0.1"));
+        assert!(!form.contains("10.1.2.3"));
+    }
+
+    #[test]
     fn malformed_csrf_never_submits_credentials() {
         let (url, server) = serve(vec![
             response("200 OK", "discovery"),
@@ -381,25 +451,29 @@ mod tests {
     #[test]
     fn classifies_auth_results_without_claiming_connectivity() {
         assert_eq!(
-            classify_response(&json!({"code":0})),
+            classify_response(&json!({"code":0})).unwrap(),
             PortalLoginOutcome::Accepted
         );
         assert_eq!(
-            classify_response(&json!({"authMsg":"密码错误"})),
+            classify_response(&json!({"authMsg":"密码错误"})).unwrap(),
             PortalLoginOutcome::CredentialsRejected
         );
         assert_eq!(
-            classify_response(&json!({"authMsg":"余额不足"})),
+            classify_response(&json!({"authMsg":"余额不足"})).unwrap(),
             PortalLoginOutcome::BalanceInsufficient
         );
         assert_eq!(
-            classify_response(&json!({"msg":"服务器繁忙"})),
+            classify_response(&json!({"msg":"服务器繁忙"})).unwrap(),
             PortalLoginOutcome::Inconclusive
         );
-        assert_eq!(
-            classify_response(&json!({})),
-            PortalLoginOutcome::Inconclusive
-        );
+        assert!(classify_response(&json!({})).is_err());
+        for response in [
+            json!({"code":0,"authMsg":"密码错误"}),
+            json!({"code":1,"msg":"success"}),
+            json!({"code":"0","msg":"success"}),
+        ] {
+            assert!(classify_response(&response).is_err());
+        }
     }
 
     #[test]
