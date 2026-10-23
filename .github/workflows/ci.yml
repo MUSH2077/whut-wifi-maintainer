@@ -55,7 +55,7 @@ jobs:
       - name: Test build isolation
         run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Build APK and manifest
-        run: python3 scripts/build_openwrt.py --sdk "${{ runner.temp }}/openwrt/sdk" --output "${{ runner.temp }}/openwrt/output" --system-rust --package-release 1
+        run: python3 scripts/build_openwrt.py --sdk "${{ runner.temp }}/openwrt/sdk" --output "${{ runner.temp }}/openwrt/output" --system-rust --package-release 2
       - name: Upload commit-pinned OpenWrt artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
