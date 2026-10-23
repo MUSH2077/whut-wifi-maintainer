@@ -177,16 +177,20 @@ mod tests {
     }
 
     #[test]
-    fn discovery_session_is_reused_for_csrf_and_login() {
+    fn redirected_discovery_session_is_reused_for_csrf_and_login() {
         use crate::config::{Config, Credentials};
         use crate::network::HttpClients;
 
         let discovery = "HTTP/1.1 200 OK\r\nSet-Cookie: portal_session=discovered; Path=/\r\nContent-Length: 9\r\nConnection: close\r\n\r\ndiscovery".to_owned();
-        let (url, server) = serve(vec![
+        let (portal_url, portal) = serve(vec![
             discovery,
             response("200 OK", "{\"csrf_token\":\"token\"}"),
             response("200 OK", "{\"code\":0}"),
         ]);
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {portal_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let (entry_url, entry) = serve(vec![redirect]);
         let config = Config::new(Credentials {
             username: "student".into(),
             password: "secret".into(),
@@ -201,16 +205,20 @@ mod tests {
                 "secret",
                 "52",
                 &Endpoints {
-                    redirect: &url,
-                    csrf: &url,
-                    login: &url,
+                    redirect: &entry_url,
+                    csrf: &portal_url,
+                    login: &portal_url,
                 },
             )
             .unwrap(),
             PortalLoginOutcome::Accepted
         );
 
-        let requests = server.join().unwrap();
+        assert_eq!(entry.join().unwrap().len(), 1);
+        let requests = portal.join().unwrap();
+        assert!(!requests[0]
+            .to_ascii_lowercase()
+            .contains("cookie: portal_session=discovered"));
         for request in &requests[1..] {
             assert!(
                 request
