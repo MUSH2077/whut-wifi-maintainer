@@ -29,11 +29,9 @@ fn query_value(url: &reqwest::Url, key: &str) -> Option<String> {
 fn valid_mac(value: &str) -> bool {
     let mut parts = value.split(':');
     (0..6).all(|_| {
-        parts
-            .next()
-            .is_some_and(|part| {
-                part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
+        parts.next().is_some_and(|part| {
+            part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
     }) && parts.next().is_none()
 }
 
@@ -135,12 +133,8 @@ fn login_at(
         .send()
         .ok()
         .and_then(|response| {
-            extract_portal_context(
-                response.url().as_str(),
-                endpoints.login,
-                fallback_nas_id,
-            )
-            .map(|context| (response.url().clone(), context))
+            extract_portal_context(response.url().as_str(), endpoints.login, fallback_nas_id)
+                .map(|context| (response.url().clone(), context))
         });
     let fallback_context = PortalContext {
         nas_id: fallback_nas_id.to_owned(),
@@ -420,10 +414,7 @@ mod tests {
         assert_eq!(context.switch_ip, "10.0.0.1");
         assert_eq!(context.user_ipv4, "10.0.0.2");
         assert_eq!(context.user_mac, "aa:bb:cc:dd:ee:ff");
-        assert!(
-            extract_portal_context("http://example.com/?nasId=123", LOGIN_URL, "52")
-                .is_none()
-        );
+        assert!(extract_portal_context("http://example.com/?nasId=123", LOGIN_URL, "52").is_none());
         let invalid = extract_portal_context(
             "http://172.30.21.100/?switchip=bad&nasId=bad&wlanuserip=bad&mac=bad",
             LOGIN_URL,
