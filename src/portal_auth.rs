@@ -216,9 +216,11 @@ mod tests {
 
         assert_eq!(entry.join().unwrap().len(), 1);
         let requests = portal.join().unwrap();
-        assert!(!requests[0]
-            .to_ascii_lowercase()
-            .contains("cookie: portal_session=discovered"));
+        assert!(
+            !requests[0]
+                .to_ascii_lowercase()
+                .contains("cookie: portal_session=discovered")
+        );
         for request in &requests[1..] {
             assert!(
                 request
