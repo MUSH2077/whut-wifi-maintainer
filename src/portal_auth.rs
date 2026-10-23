@@ -13,17 +13,57 @@ pub enum PortalLoginOutcome {
     Inconclusive,
 }
 
-fn extract_nas_id(final_url: &str) -> Option<String> {
+struct PortalContext {
+    nas_id: String,
+    switch_ip: String,
+    user_ipv4: String,
+    user_mac: String,
+}
+
+fn query_value(url: &reqwest::Url, key: &str) -> Option<String> {
+    url.query_pairs()
+        .find(|(name, value)| name == key && !value.is_empty())
+        .map(|(_, value)| value.into_owned())
+}
+
+fn valid_mac(value: &str) -> bool {
+    let mut parts = value.split(':');
+    (0..6).all(|_| {
+        parts
+            .next()
+            .is_some_and(|part| {
+                part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+    }) && parts.next().is_none()
+}
+
+fn extract_portal_context(
+    final_url: &str,
+    login_url: &str,
+    fallback_nas_id: &str,
+) -> Option<PortalContext> {
     let url = reqwest::Url::parse(final_url).ok()?;
-    let portal = reqwest::Url::parse(LOGIN_URL).ok()?;
+    let portal = reqwest::Url::parse(login_url).ok()?;
     if url.origin() != portal.origin() {
         return None;
     }
-    url.query_pairs()
-        .find(|(key, value)| {
-            key == "nasId" && !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
-        })
-        .map(|(_, value)| value.into_owned())
+    let nas_id = query_value(&url, "nasId")
+        .filter(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
+        .unwrap_or_else(|| fallback_nas_id.to_owned());
+    let ipv4 = |key| {
+        query_value(&url, key)
+            .filter(|value| value.parse::<std::net::Ipv4Addr>().is_ok())
+            .unwrap_or_default()
+    };
+    let user_mac = query_value(&url, "mac")
+        .filter(|value| valid_mac(value))
+        .unwrap_or_default();
+    Some(PortalContext {
+        nas_id,
+        switch_ip: ipv4("switchip"),
+        user_ipv4: ipv4("wlanuserip"),
+        user_mac,
+    })
 }
 
 pub fn csrf_token(json: &Value) -> Result<&str, RequestError> {
@@ -95,12 +135,23 @@ fn login_at(
         .send()
         .ok()
         .and_then(|response| {
-            extract_nas_id(response.url().as_str()).map(|nas| (response.url().clone(), nas))
+            extract_portal_context(
+                response.url().as_str(),
+                endpoints.login,
+                fallback_nas_id,
+            )
+            .map(|context| (response.url().clone(), context))
         });
-    let nas_id = redirect
+    let fallback_context = PortalContext {
+        nas_id: fallback_nas_id.to_owned(),
+        switch_ip: String::new(),
+        user_ipv4: String::new(),
+        user_mac: String::new(),
+    };
+    let context = redirect
         .as_ref()
-        .map(|(_, nas)| nas.as_str())
-        .unwrap_or(fallback_nas_id);
+        .map(|(_, context)| context)
+        .unwrap_or(&fallback_context);
     let json: Value = client
         .get(endpoints.csrf)
         .send()?
@@ -114,7 +165,12 @@ fn login_at(
         .form(&[
             ("username", username),
             ("password", password),
-            ("nasId", nas_id),
+            ("switchip", context.switch_ip.as_str()),
+            ("nasId", context.nas_id.as_str()),
+            ("userIpv4", context.user_ipv4.as_str()),
+            ("userMac", context.user_mac.as_str()),
+            ("captcha", ""),
+            ("captchaId", ""),
         ]);
     if let Some((url, _)) = redirect {
         request = request.header(REFERER, url.as_str());
@@ -187,8 +243,11 @@ mod tests {
             response("200 OK", "{\"csrf_token\":\"token\"}"),
             response("200 OK", "{\"code\":0}"),
         ]);
+        let discovery_url = format!(
+            "{portal_url}?switchip=10.1.0.1&nasId=77&wlanuserip=10.1.2.3&mac=aa:bb:cc:dd:ee:ff"
+        );
         let redirect = format!(
-            "HTTP/1.1 302 Found\r\nLocation: {portal_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            "HTTP/1.1 302 Found\r\nLocation: {discovery_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         );
         let (entry_url, entry) = serve(vec![redirect]);
         let config = Config::new(Credentials {
@@ -227,6 +286,21 @@ mod tests {
                     .to_ascii_lowercase()
                     .contains("cookie: portal_session=discovered")
             );
+        }
+        let login = &requests[2];
+        let form = login
+            .split_once("\r\n\r\n")
+            .expect("login request must contain a form body")
+            .1;
+        for field in [
+            "switchip=10.1.0.1",
+            "nasId=77",
+            "userIpv4=10.1.2.3",
+            "userMac=aa%3Abb%3Acc%3Add%3Aee%3Aff",
+            "captcha=",
+            "captchaId=",
+        ] {
+            assert!(form.contains(field), "missing {field} in login form");
         }
     }
 
@@ -335,12 +409,30 @@ mod tests {
     }
 
     #[test]
-    fn nas_id_is_only_taken_from_known_portal() {
-        assert_eq!(
-            extract_nas_id("http://172.30.21.100/?nasId=123"),
-            Some("123".into())
+    fn redirect_context_is_only_taken_from_known_portal() {
+        let context = extract_portal_context(
+            "http://172.30.21.100/?switchip=10.0.0.1&nasId=123&wlanuserip=10.0.0.2&mac=aa:bb:cc:dd:ee:ff",
+            LOGIN_URL,
+            "52",
+        )
+        .unwrap();
+        assert_eq!(context.nas_id, "123");
+        assert_eq!(context.switch_ip, "10.0.0.1");
+        assert_eq!(context.user_ipv4, "10.0.0.2");
+        assert_eq!(context.user_mac, "aa:bb:cc:dd:ee:ff");
+        assert!(
+            extract_portal_context("http://example.com/?nasId=123", LOGIN_URL, "52")
+                .is_none()
         );
-        assert_eq!(extract_nas_id("http://example.com/?nasId=123"), None);
-        assert_eq!(extract_nas_id("http://172.30.21.100/?nasId=bad"), None);
+        let invalid = extract_portal_context(
+            "http://172.30.21.100/?switchip=bad&nasId=bad&wlanuserip=bad&mac=bad",
+            LOGIN_URL,
+            "52",
+        )
+        .unwrap();
+        assert_eq!(invalid.nas_id, "52");
+        assert!(invalid.switch_ip.is_empty());
+        assert!(invalid.user_ipv4.is_empty());
+        assert!(invalid.user_mac.is_empty());
     }
 }
