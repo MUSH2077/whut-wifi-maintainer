@@ -65,8 +65,7 @@ fn encrypt(public_key: &RsaPublicKey, value: &str) -> Result<String, Box<dyn Err
 fn is_service_redirect(response_url: &reqwest::Url, location: &str) -> bool {
     let service = reqwest::Url::parse(UNIFIED_SERVICE_URL).expect("constant URL");
     response_url.join(location).is_ok_and(|destination| {
-        destination.origin() == service.origin()
-            && destination.path().starts_with(service.path())
+        destination.origin() == service.origin() && destination.path().starts_with(service.path())
     })
 }
 
